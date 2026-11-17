@@ -367,6 +367,14 @@ def uvicorn_main():
                     return_exceptions=True,
                 )
                 log.info("后台资源刷新与别名同步任务已停止")
+                # 关闭进程内复用的 Chromium，避免残留子进程
+                try:
+                    from src.app.transformers.html_to_png_transformer import shutdown_browser
+
+                    await shutdown_browser()
+                    log.info("复用中的 Chromium 已关闭")
+                except Exception:
+                    log.debug("关闭 Chromium 失败（忽略）", exc_info=True)
                 if ctx.data_repository:
                     await ctx.data_repository.close()
                     log.info("后台资源刷新子进程池已关闭")

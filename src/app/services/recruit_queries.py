@@ -4,20 +4,58 @@ from itertools import combinations
 from pathlib import Path
 from typing import Any
 import base64
+import io
 
 from src.app.context import AppContext
 from src.app.services.operator_queries import QueryExecutionResult
 from src.domain.types import QueryResult
 from src.helpers.card_urls import build_card_url
 
-RECRUIT_CARD_REVISION = "recruit-v2"
+RECRUIT_CARD_REVISION = "recruit-v3"
+
+# 卡片里头像实际只显示 72x96（见 data/templates/recruit/recruit.html.j2 的 .operator img），
+# 但此前把原图（数百 KB、上千像素）整张 base64 内联，导致单张公招卡片 HTML 可达 40MB+，
+# Chromium 光是解析与栅格化就要几十秒（A8-4500M 实测 58s）。这里先缩到 2x 显示尺寸再内联。
+_PORTRAIT_MAX_SIZE = (144, 192)
+_PORTRAIT_WEBP_QUALITY = 82
+
+
+def _portrait_data_uri(raw: bytes) -> str:
+    """把头像字节压到接近显示尺寸；Pillow 不可用或失败时退回原图内联。"""
+    try:
+        from PIL import Image
+    except Exception:
+        return "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
+
+    try:
+        with Image.open(io.BytesIO(raw)) as img:
+            img.load()
+            if img.mode not in ("RGB", "RGBA"):
+                img = img.convert("RGBA")
+            img.thumbnail(_PORTRAIT_MAX_SIZE, Image.LANCZOS)
+            buf = io.BytesIO()
+            img.save(buf, format="WEBP", quality=_PORTRAIT_WEBP_QUALITY, method=4)
+            return "data:image/webp;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception:
+        # WebP 编码器缺失等情况下退回 PNG 缩放，最后才退回原图
+        try:
+            with Image.open(io.BytesIO(raw)) as img:
+                img.load()
+                if img.mode not in ("RGB", "RGBA"):
+                    img = img.convert("RGBA")
+                img.thumbnail(_PORTRAIT_MAX_SIZE, Image.LANCZOS)
+                buf = io.BytesIO()
+                img.save(buf, format="PNG", optimize=True)
+                return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+        except Exception:
+            return "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
 
 
 def _image_data_uri(path: Path | None) -> str:
     if path is None or not path.is_file() or path.is_symlink():
         return ""
     try:
-        return "data:image/png;base64," + base64.b64encode(path.read_bytes()).decode("ascii")
+        return _portrait_data_uri(path.read_bytes())
     except OSError:
         return ""
 
@@ -161,7 +199,9 @@ async def query_recruit(context: AppContext, tags: list[str]) -> QueryExecutionR
             params={
                 "viewport": {"width": 1280, "height": 720, "deviceScaleFactor": 1},
                 "full_page": True,
-                "wait_until": "networkidle",
+                # 公招卡片是静态 HTML（图片为 <img> 标签），load 已能等齐资源；
+                # networkidle 还要额外等 500ms 网络空闲，在弱机 + 多请求场景下会拖到几十秒。
+                "wait_until": "load",
             },
             format="png",
         )
